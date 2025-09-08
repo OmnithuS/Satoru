@@ -1,0 +1,23 @@
+from sentence_transformers import SentenceTransformer
+import faiss
+import json
+
+# Embedding model
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Load knowledge base
+with open("memory.json", "r") as f:
+    data = json.load(f)
+
+knowledge_texts = data.get("knowledge_base", [])
+
+# Build vector index
+embeddings = embedder.encode(knowledge_texts, convert_to_numpy=True)
+dimension = embeddings.shape[1]
+index = faiss.IndexFlatL2(dimension)
+index.add(embeddings)
+
+def search_knowledge(query, top_k=5):
+    query_vec = embedder.encode([query], convert_to_numpy=True)
+    distances, indices = index.search(query_vec, top_k)
+    return [knowledge_texts[i] for i in indices[0] if i < len(knowledge_texts)]
