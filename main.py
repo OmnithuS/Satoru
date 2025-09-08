@@ -1,143 +1,89 @@
-import discord
-import json
 import os
-from ollama import Ollama
-from dotenv import load_dotenv
-from keep_alive import keep_alive
-from knowledge_base import search_knowledge, embedder, index, knowledge_texts
+import json
+import discord
+from discord.ext import commands
+from keep_alive import keep_alive  # Optional Flask server
+from sentence_transformers import SentenceTransformer
+import faiss
 
-# Load env vars
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-# Replace with YOUR Discord user ID
-BOT_OWNER_ID = 639200660604321803
-
-# Discord setup
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
-
-# Ollama model
-model = Ollama(model="gpt-oss:20b")
-
-# Memory load/save
-def load_memory():
-    try:
-        with open("memory.json", "r") as f:
-            return json.load(f)
-    except:
-        return {"users": {}, "knowledge_base": []}
-
-def save_memory(memory):
-    with open("memory.json", "w") as f:
-        json.dump(memory, f, indent=4)
-
-memory = load_memory()
-
-# Keep alive
+# ---- Keep bot alive via Flask server (optional) ----
 keep_alive()
 
-@client.event
+# ---- Load environment variables ----
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ---- Bot setup ----
+intents = discord.Intents.default()
+intents.messages = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ---- Load FAISS memory ----
+memory_file = "memory.json"
+if not os.path.exists(memory_file):
+    with open(memory_file, "w") as f:
+        json.dump([], f)
+
+with open(memory_file, "r") as f:
+    memory_data = json.load(f)
+
+# Sentence embedding model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Build FAISS index
+if memory_data:
+    embeddings = [model.encode(entry['text']) for entry in memory_data]
+    dimension = embeddings[0].shape[0]
+    index = faiss.IndexFlatL2(dimension)
+    for vec in embeddings:
+        index.add(vec.reshape(1, -1))
+else:
+    index = None
+
+# ---- Commands ----
+@bot.event
 async def on_ready():
-    print(f"✅ Guild Bot online as {client.user}")
+    print(f"✅ Guild Bot online as {bot.user}")
 
-@client.event
-async def on_message(message):
-    if message.author == client.user:
+@bot.command()
+async def addknowledge(ctx, *, text):
+    global memory_data, index
+    new_id = len(memory_data)
+    memory_data.append({"id": new_id, "text": text})
+    with open(memory_file, "w") as f:
+        json.dump(memory_data, f, indent=4)
+    # Add embedding to FAISS
+    if index is None:
+        dim = len(model.encode(text))
+        index = faiss.IndexFlatL2(dim)
+    index.add(model.encode(text).reshape(1, -1))
+    await ctx.send(f"Knowledge added with ID {new_id}.")
+
+@bot.command()
+async def editknowledge(ctx, id: int, *, new_text):
+    global memory_data, index
+    for entry in memory_data:
+        if entry['id'] == id:
+            entry['text'] = new_text
+            break
+    with open(memory_file, "w") as f:
+        json.dump(memory_data, f, indent=4)
+    # Rebuild FAISS index
+    embeddings = [model.encode(entry['text']) for entry in memory_data]
+    dim = embeddings[0].shape[0]
+    index = faiss.IndexFlatL2(dim)
+    for vec in embeddings:
+        index.add(vec.reshape(1, -1))
+    await ctx.send(f"Knowledge ID {id} updated.")
+
+@bot.command()
+async def query(ctx, *, question):
+    if index is None:
+        await ctx.send("No knowledge stored yet.")
         return
+    q_vec = model.encode(question).reshape(1, -1)
+    D, I = index.search(q_vec, k=3)  # Return top 3 results
+    responses = [memory_data[i]['text'] for i in I[0]]
+    await ctx.send("\n\n".join(responses))
 
-    user_id = str(message.author.id)
-
-    # --- Guild Master Commands ---
-    if message.author.id == BOT_OWNER_ID:
-
-        # Add knowledge
-        if message.content.startswith("!addknowledge"):
-            new_fact = message.content[len("!addknowledge "):].strip()
-            if new_fact:
-                memory["knowledge_base"].append(new_fact)
-                save_memory(memory)
-
-                new_vec = embedder.encode([new_fact], convert_to_numpy=True)
-                index.add(new_vec)
-                knowledge_texts.append(new_fact)
-
-                await message.channel.send(f"📚 Added to knowledge base: `{new_fact}`")
-            else:
-                await message.channel.send("⚠️ Please provide text after `!addknowledge`.")
-            return
-
-        # List knowledge
-        if message.content.startswith("!listknowledge"):
-            kb = memory["knowledge_base"]
-            if not kb:
-                await message.channel.send("📖 Knowledge base is empty.")
-            else:
-                response = "\n".join([f"{i}. {fact}" for i, fact in enumerate(kb[:10])])
-                await message.channel.send(f"📚 Knowledge Base (first 10):\n{response}")
-            return
-
-        # Remove knowledge
-        if message.content.startswith("!removeknowledge"):
-            try:
-                index_to_remove = int(message.content.split(" ")[1])
-                removed_fact = memory["knowledge_base"].pop(index_to_remove)
-                save_memory(memory)
-
-                # Rebuild index
-                knowledge_texts.pop(index_to_remove)
-                embeddings = embedder.encode(knowledge_texts, convert_to_numpy=True)
-                index.reset()
-                index.add(embeddings)
-
-                await message.channel.send(f"🗑️ Removed: `{removed_fact}`")
-            except:
-                await message.channel.send("⚠️ Usage: `!removeknowledge <index>`")
-            return
-
-        # Edit knowledge
-        if message.content.startswith("!editknowledge"):
-            try:
-                parts = message.content.split(" ", 2)
-                index_to_edit = int(parts[1])
-                new_fact = parts[2].strip()
-
-                old_fact = memory["knowledge_base"][index_to_edit]
-                memory["knowledge_base"][index_to_edit] = new_fact
-                save_memory(memory)
-
-                knowledge_texts[index_to_edit] = new_fact
-                embeddings = embedder.encode(knowledge_texts, convert_to_numpy=True)
-                index.reset()
-                index.add(embeddings)
-
-                await message.channel.send(f"✏️ Updated knowledge:\n`{old_fact}` → `{new_fact}`")
-            except:
-                await message.channel.send("⚠️ Usage: `!editknowledge <index> <new text>`")
-            return
-
-    # --- Regular Conversation ---
-    if client.user.mentioned_in(message):
-        if user_id not in memory["users"]:
-            memory["users"][user_id] = {"messages": [], "rank": "E-Rank 🌱✨"}
-
-        memory["users"][user_id]["messages"].append(message.content)
-        save_memory(memory)
-
-        user_history = "\n".join(memory["users"][user_id]["messages"][-5:])
-        knowledge = search_knowledge(message.content, top_k=5)
-
-        prompt = f"""
-You are the Guild Instructor, a wise and patient mentor.
-User rank: {memory['users'][user_id]['rank']}
-Relevant knowledge: {knowledge}
-User’s recent history: {user_history}
-
-Respond as a roleplay character, always helpful and instructive.
-"""
-
-        reply = model.generate(prompt)
-        await message.channel.send(reply)
-
-client.run(DISCORD_TOKEN)
+# ---- Run Bot ----
+bot.run(DISCORD_TOKEN)
