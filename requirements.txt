@@ -1,6 +1,5 @@
 discord.py
 flask
 python-dotenv
-ollama
 faiss-cpu
 sentence-transformers
